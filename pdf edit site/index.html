@@ -1,0 +1,712 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Upload, Download, RefreshCw } from 'lucide-react';
+
+const PDFProcessor = () => {
+  const [pdfDoc, setPdfDoc] = useState(null);
+  const [pages, setPages] = useState([]);
+  const [activePage, setActivePage] = useState(0);
+  const [filters, setFilters] = useState({
+    invert: false,
+    grayscale: false,
+    bw: false,
+    contrast: false,
+    removeShadow: false
+  });
+  const [layout, setLayout] = useState('1up');
+  const [showPageNumbers, setShowPageNumbers] = useState(true);
+  const [marginSide, setMarginSide] = useState(10); // in mm - left/right
+  const [marginTopBottom, setMarginTopBottom] = useState(10); // in mm - top/bottom
+  const [gapBetweenPages, setGapBetweenPages] = useState(5); // in mm
+  const [loading, setLoading] = useState(false);
+  const [scriptsLoaded, setScriptsLoaded] = useState(false);
+  const canvasRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    const loadScripts = async () => {
+      try {
+        // Load PDF.js
+        if (!window.pdfjsLib) {
+          const pdfScript = document.createElement('script');
+          pdfScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+          document.head.appendChild(pdfScript);
+
+          await new Promise((resolve, reject) => {
+            pdfScript.onload = () => {
+              if (window.pdfjsLib) {
+                window.pdfjsLib.GlobalWorkerOptions.workerSrc = 
+                  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                resolve();
+              } else {
+                reject(new Error('PDF.js failed to load'));
+              }
+            };
+            pdfScript.onerror = reject;
+            setTimeout(() => reject(new Error('PDF.js load timeout')), 15000);
+          });
+        }
+
+        // Load jsPDF
+        if (!window.jspdf) {
+          const jspdfScript = document.createElement('script');
+          jspdfScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+          document.head.appendChild(jspdfScript);
+
+          await new Promise((resolve, reject) => {
+            jspdfScript.onload = () => {
+              if (window.jspdf) {
+                resolve();
+              } else {
+                reject(new Error('jsPDF failed to load'));
+              }
+            };
+            jspdfScript.onerror = reject;
+            setTimeout(() => reject(new Error('jsPDF load timeout')), 15000);
+          });
+        }
+
+        setScriptsLoaded(true);
+        console.log('Scripts loaded successfully');
+      } catch (error) {
+        console.error('Script loading error:', error);
+        alert('Failed to load required libraries: ' + error.message);
+      }
+    };
+
+    loadScripts();
+  }, []);
+
+  const applyFiltersToCanvas = (ctx, width, height) => {
+    if (!filters.invert && !filters.grayscale && !filters.bw && !filters.contrast && !filters.removeShadow) {
+      return; // No filters to apply
+    }
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+    
+    // Step 1: Remove Shadow - Simple and effective approach
+    if (filters.removeShadow) {
+      for (let i = 0; i < data.length; i += 4) {
+        // Convert to grayscale
+        let gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        
+        // Step 1: Increase brightness (lift shadows)
+        gray = gray + 40;
+        
+        // Step 2: Apply S-curve for contrast
+        // Makes darks darker and lights lighter
+        gray = gray / 255; // Normalize to 0-1
+        
+        if (gray < 0.5) {
+          // Dark areas (text) - keep dark
+          gray = 2 * gray * gray;
+        } else {
+          // Light areas (background) - push to white
+          gray = 1 - 2 * (1 - gray) * (1 - gray);
+        }
+        
+        gray = gray * 255; // Back to 0-255
+        gray = Math.min(255, Math.max(0, gray));
+        
+        data[i] = gray;
+        data[i + 1] = gray;
+        data[i + 2] = gray;
+      }
+    }
+    
+    // Step 2: Apply other filters
+    for (let i = 0; i < data.length; i += 4) {
+      let r = data[i];
+      let g = data[i + 1];
+      let b = data[i + 2];
+
+      // Apply Grayscale first if needed
+      if (filters.grayscale || filters.bw) {
+        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        r = g = b = gray;
+      }
+
+      // Apply Black & White threshold
+      if (filters.bw) {
+        const threshold = 128;
+        r = g = b = r > threshold ? 255 : 0;
+      }
+
+      // Apply Invert
+      if (filters.invert) {
+        r = 255 - r;
+        g = 255 - g;
+        b = 255 - b;
+      }
+
+      // Apply Contrast boost
+      if (filters.contrast) {
+        const factor = 1.5;
+        r = Math.min(255, Math.max(0, (r - 128) * factor + 128));
+        g = Math.min(255, Math.max(0, (g - 128) * factor + 128));
+        b = Math.min(255, Math.max(0, (b - 128) * factor + 128));
+      }
+
+      data[i] = r;
+      data[i + 1] = g;
+      data[i + 2] = b;
+    }
+    
+    ctx.putImageData(imageData, 0, 0);
+  };
+
+  const renderPreview = async (pageIndex) => {
+    if (!pdfDoc || !pages[pageIndex] || !scriptsLoaded) {
+      console.log('Cannot render:', { pdfDoc, pageIndex, pagesLength: pages.length, scriptsLoaded });
+      return;
+    }
+    
+    try {
+      console.log('Rendering page', pages[pageIndex].pageNum);
+      const page = await pdfDoc.getPage(pages[pageIndex].pageNum);
+      const viewport = page.getViewport({ scale: 2.0 }); // Increased from 1.5 to 2.0 for better quality
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        console.log('Canvas not found');
+        return;
+      }
+      
+      const ctx = canvas.getContext('2d');
+      
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      
+      // WHITE BACKGROUND FIX
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
+      // Render the PDF page
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      console.log('Page rendered, applying filters');
+      
+      // Apply filters
+      applyFiltersToCanvas(ctx, canvas.width, canvas.height);
+      console.log('Filters applied');
+    } catch (error) {
+      console.error('Render error:', error);
+      alert('Error rendering page: ' + error.message);
+    }
+  };
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (!scriptsLoaded) {
+      alert('Libraries are still loading. Please wait a moment and try again.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      console.log('Loading PDF file');
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      setPdfDoc(pdf);
+      console.log('PDF loaded, pages:', pdf.numPages);
+
+      const pageData = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        pageData.push({
+          pageNum: i,
+          included: true,
+          thumbnail: null
+        });
+      }
+      setPages(pageData);
+      setActivePage(0);
+      
+      // Generate thumbnails
+      console.log('Generating thumbnails');
+      for (let i = 0; i < pdf.numPages; i++) {
+        const page = await pdf.getPage(i + 1);
+        const viewport = page.getViewport({ scale: 0.3 });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext('2d');
+        
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        const thumbnail = canvas.toDataURL();
+        
+        setPages(prev => {
+          const newPages = [...prev];
+          newPages[i].thumbnail = thumbnail;
+          return newPages;
+        });
+      }
+      console.log('Thumbnails generated');
+    } catch (error) {
+      console.error('Error loading PDF:', error);
+      alert('Failed to load PDF: ' + error.message);
+    }
+    
+    setLoading(false);
+  };
+
+  // Real-time preview update whenever filters change
+  useEffect(() => {
+    console.log('Effect triggered:', { pdfDoc: !!pdfDoc, pagesLength: pages.length, scriptsLoaded, activePage });
+    if (pdfDoc && pages.length > 0 && scriptsLoaded) {
+      renderPreview(activePage);
+    }
+  }, [activePage, filters, pdfDoc, pages, scriptsLoaded]);
+
+  const togglePage = (index) => {
+    setPages(prev => {
+      const newPages = [...prev];
+      newPages[index].included = !newPages[index].included;
+      return newPages;
+    });
+  };
+
+  const toggleFilter = (filterName) => {
+    console.log('Toggling filter:', filterName);
+    setFilters(prev => ({
+      ...prev,
+      [filterName]: !prev[filterName]
+    }));
+  };
+
+  const getActiveFiltersText = () => {
+    const active = [];
+    if (filters.invert) active.push('Invert');
+    if (filters.grayscale) active.push('Grayscale');
+    if (filters.bw) active.push('B&W');
+    if (filters.contrast) active.push('Contrast');
+    if (filters.removeShadow) active.push('Remove Shadow');
+    return active.length > 0 ? active.join(' + ') : 'None';
+  };
+
+  const exportPDF = async () => {
+    console.log('Export PDF clicked');
+    
+    if (!pdfDoc) {
+      alert('No PDF loaded!');
+      return;
+    }
+
+    if (!window.jspdf || !scriptsLoaded) {
+      alert('PDF export library not loaded yet. Please wait and try again.');
+      return;
+    }
+    
+    setLoading(true);
+    try {
+      console.log('Starting export');
+      const { jsPDF } = window.jspdf;
+      
+      const includedPages = pages.filter(p => p.included);
+      console.log('Exporting pages:', includedPages.length);
+      
+      if (includedPages.length === 0) {
+        alert('No pages selected for export!');
+        setLoading(false);
+        return;
+      }
+      
+      // Get first page to determine orientation
+      const firstPage = await pdfDoc.getPage(includedPages[0].pageNum);
+      const firstViewport = firstPage.getViewport({ scale: 1 });
+      const isLandscape = firstViewport.width > firstViewport.height;
+      
+      // Create PDF with correct orientation
+      const pageWidth = isLandscape ? 792 : 612;
+      const pageHeight = isLandscape ? 612 : 792;
+      const marginSidePt = marginSide * 2.83465; // Convert mm to points
+      const marginTopBottomPt = marginTopBottom * 2.83465;
+      const gapPt = gapBetweenPages * 2.83465;
+      
+      const pagesPerSheet = layout === '1up' ? 1 : layout === '2up' ? 2 : 4;
+      let pdf = null;
+      let sheetCount = 0;
+      
+      for (let i = 0; i < includedPages.length; i += pagesPerSheet) {
+        sheetCount++;
+        console.log('Processing sheet', sheetCount);
+        
+        // Create new page or initialize PDF
+        if (pdf === null) {
+          pdf = new jsPDF(isLandscape ? 'landscape' : 'portrait', 'pt', 'letter');
+        } else {
+          pdf.addPage([pageWidth, pageHeight], isLandscape ? 'landscape' : 'portrait');
+        }
+        
+        const batch = includedPages.slice(i, i + pagesPerSheet);
+        
+        for (let j = 0; j < batch.length; j++) {
+          const pageData = batch[j];
+          console.log(`Sheet ${sheetCount}, Position ${j + 1}: Rendering page ${pageData.pageNum}`);
+          const page = await pdfDoc.getPage(pageData.pageNum);
+          
+          let x, y, w, h;
+          
+          if (layout === '1up') {
+            w = pageWidth - (2 * marginSidePt);
+            h = pageHeight - (2 * marginTopBottomPt);
+            x = marginSidePt;
+            y = marginTopBottomPt;
+          } else if (layout === '2up') {
+            if (isLandscape) {
+              // Side by side for landscape
+              w = (pageWidth - (2 * marginSidePt) - gapPt) / 2;
+              h = pageHeight - (2 * marginTopBottomPt);
+              x = marginSidePt + (j * (w + gapPt));
+              y = marginTopBottomPt;
+            } else {
+              // Stacked vertically for portrait
+              w = pageWidth - (2 * marginSidePt);
+              h = (pageHeight - (2 * marginTopBottomPt) - gapPt) / 2;
+              x = marginSidePt;
+              y = marginTopBottomPt + (j * (h + gapPt));
+            }
+          } else { // 4up - vertical priority
+            w = (pageWidth - (2 * marginSidePt) - gapPt) / 2;
+            h = (pageHeight - (2 * marginTopBottomPt) - gapPt) / 2;
+            // Vertical-priority order: TL(0), BL(1), TR(2), BR(3)
+            if (j === 0) { x = marginSidePt; y = marginTopBottomPt; }
+            else if (j === 1) { x = marginSidePt; y = marginTopBottomPt + h + gapPt; }
+            else if (j === 2) { x = marginSidePt + w + gapPt; y = marginTopBottomPt; }
+            else { x = marginSidePt + w + gapPt; y = marginTopBottomPt + h + gapPt; }
+          }
+          
+          console.log(`Position: x=${x}, y=${y}, w=${w}, h=${h}`);
+          
+          // Calculate scale with higher resolution for document quality
+          const originalViewport = page.getViewport({ scale: 1 });
+          const scaleX = w / originalViewport.width;
+          const scaleY = h / originalViewport.height;
+          const scale = Math.min(scaleX, scaleY) * 2; // Double resolution for crisp text
+          
+          const viewport = page.getViewport({ scale });
+          const tempCanvas = document.createElement('canvas');
+          tempCanvas.width = viewport.width;
+          tempCanvas.height = viewport.height;
+          const tempCtx = tempCanvas.getContext('2d', { alpha: false });
+          
+          // White background
+          tempCtx.fillStyle = '#FFFFFF';
+          tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+          
+          // Render page
+          await page.render({ canvasContext: tempCtx, viewport }).promise;
+          
+          // Apply filters
+          applyFiltersToCanvas(tempCtx, tempCanvas.width, tempCanvas.height);
+          
+          // Calculate fitted dimensions
+          const imgWidth = Math.min(viewport.width, w);
+          const imgHeight = Math.min(viewport.height, h);
+          const offsetX = x + (w - imgWidth) / 2;
+          const offsetY = y + (h - imgHeight) / 2;
+          
+          console.log(`Image: width=${imgWidth}, height=${imgHeight}, offsetX=${offsetX}, offsetY=${offsetY}`);
+          
+          // Convert to high-quality PNG for document PDFs (better for text)
+          const imgData = tempCanvas.toDataURL('image/png');
+          pdf.addImage(imgData, 'PNG', offsetX, offsetY, imgWidth, imgHeight);
+          
+          // Border around allocated space
+          pdf.setDrawColor(0, 0, 0);
+          pdf.setLineWidth(1);
+          pdf.rect(x, y, w, h);
+          
+          // Page number (just the number, no "Page" text)
+          if (showPageNumbers) {
+            pdf.setFontSize(10);
+            pdf.setTextColor(100, 100, 100);
+            pdf.text(`${pageData.pageNum}`, x + w - 20, y + h - 10);
+          }
+        }
+      }
+      
+      console.log('Saving PDF with', sheetCount, 'sheets');
+      pdf.save('processed-document.pdf');
+      console.log('PDF saved successfully');
+    } catch (error) {
+      console.error('Export error:', error);
+      alert('Failed to export PDF: ' + error.message);
+    }
+    
+    setLoading(false);
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 p-6">
+      <div className="max-w-7xl mx-auto">
+        {/* Header Card */}
+        <div className="bg-white rounded-2xl shadow-xl p-8 mb-6 border border-indigo-100">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center">
+                <svg className="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <div>
+                <h1 className="text-3xl font-bold bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent">
+                  Multi-Page PDF Processor
+                </h1>
+                <p className="text-sm text-slate-500 mt-1">Professional document processing tool</p>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="text-sm font-medium text-indigo-600 italic">by Nafis Irfan</div>
+              <div className="text-xs text-slate-500 mt-1">
+                {scriptsLoaded ? (
+                  <span className="flex items-center gap-1 text-green-600">
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                    Ready to use
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1 text-amber-600">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    Loading libraries...
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex flex-wrap gap-3 mt-6">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!scriptsLoaded}
+              className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl hover:from-indigo-700 hover:to-purple-700 transition-all shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+            >
+              <Upload size={20} />
+              Upload PDF
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
+            
+            {pdfDoc && (
+              <button
+                onClick={exportPDF}
+                disabled={loading || pages.filter(p => p.included).length === 0 || !scriptsLoaded}
+                className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-green-600 to-emerald-600 text-white rounded-xl hover:from-green-700 hover:to-emerald-700 transition-all shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+              >
+                <Download size={20} />
+                Export PDF ({pages.filter(p => p.included).length} pages)
+              </button>
+            )}
+          </div>
+
+          {pdfDoc && (
+            <>
+              <div className="mt-8">
+                <h3 className="text-lg font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                  <div className="w-1 h-5 bg-gradient-to-b from-indigo-500 to-purple-500 rounded"></div>
+                  Filters (Toggle Multiple)
+                </h3>
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                  {[
+                    { key: 'invert', label: 'Invert', icon: '🔄' },
+                    { key: 'grayscale', label: 'Grayscale', icon: '⚫' },
+                    { key: 'bw', label: 'Black & White', icon: '◐' },
+                    { key: 'contrast', label: 'Boost Contrast', icon: '✨' },
+                    { key: 'removeShadow', label: 'Remove Shadow', icon: '☀️' }
+                  ].map(filter => (
+                    <label 
+                      key={filter.key}
+                      className="relative flex items-center gap-3 p-4 border-2 rounded-xl cursor-pointer transition-all hover:scale-105"
+                      style={{ 
+                        borderColor: filters[filter.key] ? '#6366f1' : '#e2e8f0',
+                        backgroundColor: filters[filter.key] ? '#eef2ff' : 'white',
+                        boxShadow: filters[filter.key] ? '0 4px 6px -1px rgba(99, 102, 241, 0.2)' : 'none'
+                      }}>
+                      <input
+                        type="checkbox"
+                        checked={filters[filter.key]}
+                        onChange={() => toggleFilter(filter.key)}
+                        className="w-5 h-5 accent-indigo-600"
+                      />
+                      <span className="font-medium text-slate-700 flex items-center gap-2">
+                        <span>{filter.icon}</span>
+                        {filter.label}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-4 p-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-indigo-200">
+                  <span className="text-sm font-semibold text-indigo-700">Active Filters: </span>
+                  <span className="text-sm text-indigo-600">{getActiveFiltersText()}</span>
+                </div>
+              </div>
+
+              <div className="mt-8">
+                <h3 className="text-lg font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                  <div className="w-1 h-5 bg-gradient-to-b from-indigo-500 to-purple-500 rounded"></div>
+                  Layout & Spacing Options
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="bg-white p-4 rounded-xl border-2 border-slate-200">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Layout</label>
+                    <select
+                      value={layout}
+                      onChange={(e) => setLayout(e.target.value)}
+                      className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    >
+                      <option value="1up">📄 1-up (One per sheet)</option>
+                      <option value="2up">📋 2-up (Two per sheet)</option>
+                      <option value="4up">📑 4-up (Vertical Priority)</option>
+                    </select>
+                  </div>
+                  
+                  <div className="bg-white p-4 rounded-xl border-2 border-slate-200">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Side Margin (mm)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="50"
+                      step="1"
+                      value={marginSide}
+                      onChange={(e) => setMarginSide(Number(e.target.value))}
+                      className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                  
+                  <div className="bg-white p-4 rounded-xl border-2 border-slate-200">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Top/Bottom Margin (mm)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="50"
+                      step="1"
+                      value={marginTopBottom}
+                      onChange={(e) => setMarginTopBottom(Number(e.target.value))}
+                      className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                  
+                  <div className="bg-white p-4 rounded-xl border-2 border-slate-200">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Gap Between Pages (mm)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="25"
+                      step="1"
+                      value={gapBetweenPages}
+                      onChange={(e) => setGapBetweenPages(Number(e.target.value))}
+                      className="w-full px-4 py-2 border-2 border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                </div>
+              </div>
+              
+              <div className="mt-6">
+                <label className="inline-flex items-center gap-3 cursor-pointer p-4 border-2 rounded-xl transition-all hover:scale-105"
+                  style={{ 
+                    borderColor: showPageNumbers ? '#6366f1' : '#e2e8f0',
+                    backgroundColor: showPageNumbers ? '#eef2ff' : 'white',
+                    boxShadow: showPageNumbers ? '0 4px 6px -1px rgba(99, 102, 241, 0.2)' : 'none'
+                  }}>
+                  <input
+                    type="checkbox"
+                    checked={showPageNumbers}
+                    onChange={(e) => setShowPageNumbers(e.target.checked)}
+                    className="w-5 h-5 accent-indigo-600"
+                  />
+                  <span className="font-medium text-slate-700">🔢 Show Page Numbers in Export</span>
+                </label>
+              </div>
+            </>
+          )}
+        </div>
+
+        {pdfDoc && (
+          <>
+            <div className="bg-white rounded-2xl shadow-xl p-6 mb-6 border border-indigo-100">
+              <h2 className="text-lg font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                <div className="w-1 h-5 bg-gradient-to-b from-indigo-500 to-purple-500 rounded"></div>
+                Page Thumbnails 
+                <span className="ml-2 px-3 py-1 bg-gradient-to-r from-indigo-100 to-purple-100 text-indigo-700 rounded-full text-sm font-bold">
+                  {pages.filter(p => p.included).length}/{pages.length} included
+                </span>
+              </h2>
+              <div className="flex gap-4 overflow-x-auto pb-3">
+                {pages.map((page, idx) => (
+                  <div
+                    key={idx}
+                    className={`flex-shrink-0 border-2 rounded-xl p-3 cursor-pointer transition-all hover:scale-105 ${
+                      activePage === idx ? 'border-indigo-500 bg-gradient-to-br from-indigo-50 to-purple-50 shadow-lg' : 'border-slate-200 bg-white'
+                    } ${!page.included ? 'opacity-40' : ''}`}
+                  >
+                    <div onClick={() => setActivePage(idx)}>
+                      {page.thumbnail ? (
+                        <img
+                          src={page.thumbnail}
+                          alt={`Page ${page.pageNum}`}
+                          className="w-28 h-auto mb-2 rounded-lg shadow-md"
+                        />
+                      ) : (
+                        <div className="w-28 h-36 bg-gradient-to-br from-slate-100 to-slate-200 mb-2 rounded-lg flex items-center justify-center">
+                          <RefreshCw className="animate-spin text-slate-400" size={20} />
+                        </div>
+                      )}
+                      <div className="text-xs text-center text-slate-600 mb-2 font-bold">
+                        Page {page.pageNum}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => togglePage(idx)}
+                      className={`w-full px-3 py-2 text-xs rounded-lg transition-all font-semibold ${
+                        page.included
+                          ? 'bg-gradient-to-r from-red-500 to-pink-500 text-white hover:from-red-600 hover:to-pink-600'
+                          : 'bg-gradient-to-r from-green-500 to-emerald-500 text-white hover:from-green-600 hover:to-emerald-600'
+                      }`}
+                    >
+                      {page.included ? '✕ Remove' : '✓ Include'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-white rounded-2xl shadow-xl p-6 border border-indigo-100">
+              <h2 className="text-lg font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                <div className="w-1 h-5 bg-gradient-to-b from-indigo-500 to-purple-500 rounded"></div>
+                Interactive Preview: Page {pages[activePage]?.pageNum}
+                {!pages[activePage]?.included && (
+                  <span className="ml-2 px-3 py-1 bg-red-100 text-red-700 rounded-full text-sm font-bold">
+                    ❌ Excluded from Export
+                  </span>
+                )}
+              </h2>
+              <div className="overflow-auto max-h-[600px] border-2 border-indigo-200 rounded-xl bg-gradient-to-br from-slate-50 to-slate-100 p-6">
+                <canvas ref={canvasRef} className="mx-auto shadow-2xl rounded-lg" />
+              </div>
+            </div>
+          </>
+        )}
+
+        {loading && (
+          <div className="fixed inset-0 bg-black bg-opacity-60 backdrop-blur-sm flex items-center justify-center z-50">
+            <div className="bg-white rounded-2xl p-8 flex flex-col items-center gap-4 shadow-2xl">
+              <RefreshCw className="animate-spin text-indigo-600" size={40} />
+              <span className="text-xl font-bold text-slate-800">Processing...</span>
+              <span className="text-sm text-slate-500">Please wait while we process your PDF</span>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default PDFProcessor;
